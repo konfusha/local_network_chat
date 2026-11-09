@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+LAN Chat — простой чат по локальной сети в терминале.
+Использует только стандартную библиотеку Python (никаких внешних модулей).
+
+Запуск:
+    python chat.py              — интерактивное меню (хост или подключение)
+    python chat.py --host 7777  — сразу запустить сервер на порту 7777
+    python chat.py --join 192.168.1.5 7777 — сразу подключиться
+"""
+
+import argparse
+import json
+import codecs
+import os
+import shutil
+import socket
+import sys
+import threading
+import time
+
+IS_WINDOWS = os.name == "nt"
+
+if IS_WINDOWS:
+    import msvcrt
+else:
+    import termios as _termios
+
+DEFAULT_PORT = 7777
+TYPING_TIMEOUT = 3.0   # сколько секунд «печатает…» остаётся включённым после события
+TYPING_REFRESH = 2.0   # как часто обновлять «печатает…» (keep-alive)
+
+
+# ----------------------------------------------------------------------------
+# Ввод по одному символу (без сторонних модулей)
+# ----------------------------------------------------------------------------
+
+_DECODER = codecs.getincrementaldecoder("utf-8")()
+
+class _RawInput:
+    """Переключает терминал в режим без эха (Unix). Ничего не делает на Windows."""
+
+    def __init__(self):
+        self.fd = None
+        self.old = None
+        if not IS_WINDOWS and sys.stdin.isatty():
+            self.fd = sys.stdin.fileno()
+            self.old = _termios.tcgetattr(self.fd)
+            _termios.setcbreak(self.fd)
+
+    def restore(self):
+        if self.fd is not None:
+            try:
+                _termios.tcsetattr(self.fd, _termios.TCSADRAIN, self.old)
+            except Exception:
+                pass
+            self.fd = None
+
+
+def read_char():
+    """Возвращает один введённый символ, '' для служебных клавиш, None при EOF."""
+    if not sys.stdin.isatty():
+        # stdin перенаправлен (скрипт/pipe) — читаем байты
+        b = sys.stdin.buffer.read(1)
+        if not b:
+            return None
+        return _DECODER.decode(b)
+
+    if IS_WINDOWS:
+        try:
+            ch = msvcrt.getwch()
+        except Exception:
+            return None
+        if ch in ("\x00", "\xe0"):   # стрелки, F-клавиши и т.п.
+            try:
+                msvcrt.getwch()
+            except Exception:
+                pass
+            return ""
+        return ch
+
+    # Linux/macOS: читаем по байту и собираем многобайтовые UTF-8 символы
+    while True:
+        try:
+            b = sys.stdin.buffer.read(1)
+        except Exception:
+            return None
+        if not b:
+            return None
+        ch = _DECODER.decode(b)
+        if ch:
+            return ch
+
+
+# ----------------------------------------------------------------------------
+# Интерфейс
+# ----------------------------------------------------------------------------
+
+class UI:
+    """Печатает входящие сообщения поверх строки ввода, не ломая её."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.buffer = ""                 # то, что пользователь уже набрал
+        self.my_name = "Вы"
+        self.peer_name = "Собеседник"
+        self.peer_typing_until = 0.0     # time.monotonic(), до которого показывать «печатает…»
+
+    # --- вспомогательные ---
+
+    def _width(self):
+        try:
+            w = shutil.get_terminal_size((80, 24)).columns
+        except Exception:
+            w = 80
+        return max(10, w)
+
+    def _clear_line(self):
+        sys.stdout.write("\r" + " " * (self._width() - 1) + "\r")
+
+    def _draw_input(self):
+        now = time.monotonic()
+        line = self.my_name + "> " + self.buffer
+        if now < self.peer_typing_until:
+            line += "   ⟵ печатает…"
+        line = line[: self._width() - 1]
+        sys.stdout.write("\r" + line.ljust(self._width() - 1) + "\r")
+
+    def redraw(self):
+        with self.lock:
+            self._draw_input()
+
+    # --- публичные ---
+
+    def set_my_name(self, name):
+        self.my_name = name or "Вы"
+        self.redraw()
+
+    def set_peer_name(self, name):
+        with self.lock:
+            self.peer_name = (name or "Собеседник").strip()[:30] or "Собеседник"
+            self._draw_input()
+
+    def set_peer_typing(self, until_monotonic):
+        changed = False
+        with self.lock:
+            if until_monotonic != self.peer_typing_until:
+                self.peer_typing_until = until_monotonic
+                changed = True
+            if changed:
+                self._draw_input()
+
+    def log(self, text):
+        with self.lock:
+            self._clear_line()
+            try:
+                sys.stdout.write(text + "\n")
+            except Exception:
+                sys.stdout.write(text.encode("utf-8", "replace").decode("utf-8", "replace") + "\n")
+            self._draw_input()
+
+
+# ----------------------------------------------------------------------------
+# Сеть
+# ----------------------------------------------------------------------------
+
+def send_event(sock, obj):
+    data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+    sock.sendall(data)
+
+
+def local_ip():
+    """Возвращает IP-адрес этого компьютера в локальной сети."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        pass
+    finally:
+        s.close()
+    try:
+        infos = socket.gethostbyname_ex(socket.gethostname())
+        for ip in infos[2]:
+            if not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
+def recv_loop(sock, ui, stop_event):
+    try:
+        f = sock.makefile("rb")
+        with f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line.decode("utf-8"))
+                except Exception:
+                    continue
+                t = ev.get("type")
+                if t == "msg":
+                    ui.set_peer_typing(0.0)
+                    ui.log(f"{ui.peer_name}: {ev.get('text', '')}")
+                elif t == "typing":
+                    if ev.get("state"):
+                        ui.set_peer_typing(time.monotonic() + TYPING_TIMEOUT)
+                    else:
+                        ui.set_peer_typing(0.0)
+                elif t == "name":
+                    ui.set_peer_name(str(ev.get("name", "Собеседник")))
+                elif t == "bye":
+                    ui.log(f"{ui.peer_name} вышел из чата.")
+                    break
+    except OSError:
+        pass
+    finally:
+        if not stop_event.is_set():
+            ui.log("Соединение закрыто.")
+
+
+# ----------------------------------------------------------------------------
+# Сессия чата
+# ----------------------------------------------------------------------------
+
+def run_chat(sock, my_name, ui):
+    stop_event = threading.Event()
+    t = threading.Thread(target=recv_loop, args=(sock, ui, stop_event), daemon=True)
+    t.start()
+
+    try:
+        send_event(sock, {"type": "name", "name": my_name})
+    except OSError:
+        ui.log("Не удалось отправить приветствие.")
+        sock.close()
+        return
+
+    ui.log("Связь установлена. Введите сообщение и нажмите Enter.")
+    ui.log("Команды: /name Имя — сменить имя,  /help — помощь,  /quit — выход.")
+
+    raw = _RawInput()
+    typing_state = False
+    last_typing_sent = 0.0
+
+    try:
+        while not stop_event.is_set():
+            ch = read_char()
+
+            if ch is None or ch == "\x03":          # EOF или Ctrl+C
+                break
+            if ch == "":                            # служебная клавиша (стрелки и т.п.)
+                continue
+
+            if ch in ("\r", "\n"):                  # Enter — отправить
+                text = ui.buffer.strip()
+                ui.buffer = ""
+                if text:
+                    if text.startswith("/"):
+                        cmd = text.split(maxsplit=1)
+                        if cmd[0].lower() in ("/quit", "/exit", "/q"):
+                            break
+                        if cmd[0].lower() == "/name" and len(cmd) > 1:
+                            new_name = cmd[1].strip()[:30]
+                            if new_name:
+                                my_name = new_name
+                                ui.set_my_name(new_name)
+                                ui.log(f"Ваше имя теперь: {new_name}")
+                                send_event(sock, {"type": "name", "name": new_name})
+                                continue
+                        if text.lower() == "/help":
+                            ui.log("Команды: /name Имя, /help, /quit")
+                            continue
+                        # неизвестная команда — отправим как обычное сообщение
+                    send_event(sock, {"type": "msg", "text": text})
+                    send_event(sock, {"type": "typing", "state": False})
+                    ui.log(f"{my_name}: {text}")
+                    typing_state = False
+            elif ch in ("\x08", "\x7f"):            # Backspace
+                if ui.buffer:
+                    ui.buffer = ui.buffer[:-1]
+                    if ui.buffer:
+                        ui.redraw()
+            else:
+                if ch.isprintable():
+                    ui.buffer += ch
+                    ui.redraw()
+
+            # обновляем индикатор «печатает…» у собеседника
+            now = time.monotonic()
+            active = bool(ui.buffer)
+            if active != typing_state or (active and now - last_typing_sent >= TYPING_REFRESH):
+                send_event(sock, {"type": "typing", "state": active})
+                last_typing_sent = now
+                typing_state = active
+
+    except (OSError, ConnectionResetError, BrokenPipeError):
+        ui.log("Ошибка соединения.")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            send_event(sock, {"type": "bye"})
+        except OSError:
+            pass
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+        stop_event.set()
+        raw.restore()
+        ui.log("Чат завершён.")
+
+
+# ----------------------------------------------------------------------------
+# Меню
+# ----------------------------------------------------------------------------
+
+class AskEOF(str):
+    """Сигнальное значение: поток ввода закончился (Ctrl+D/Ctrl+Z, pipe закрыт)."""
+
+
+_EOF = AskEOF()
+
+
+def _is_eof(val):
+    return isinstance(val, AskEOF)
+
+
+def ask(prompt, default=""):
+    try:
+        val = input(prompt).strip()
+    except EOFError:
+        return AskEOF()
+    except KeyboardInterrupt:
+        print()
+        return AskEOF()
+    return val or default
+
+
+def ask_port(prompt, default=DEFAULT_PORT):
+    raw = ask(prompt, str(default))
+    try:
+        port = int(raw)
+    except ValueError:
+        print(f"Некорректный порт, использую {default}.")
+        return default
+    if not (1 <= port <= 65535):
+        print(f"Порт вне диапазона 1-65535, использую {default}.")
+        return default
+    return port
+
+
+def ask_port(prompt, default=DEFAULT_PORT):
+    raw = ask(prompt, str(default))
+    if _is_eof(raw):
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"Некорректный порт «{raw}», использую {default}.")
+        return default
+
+
+def host_session(port, ui):
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("", port))
+        server.listen(1)
+        ui.log(f"Сервер запущен. Ваш IP для подключения: {local_ip()}, порт {port}")
+        ui.log("Ожидание подключения собеседника… (Ctrl+C для отмены)")
+        conn, addr = server.accept()
+    except KeyboardInterrupt:
+        print()
+        server.close()
+        return
+    except OSError as e:
+        ui.log(f"Не удалось занять порт {port}: {e}")
+        server.close()
+        return
+
+    server.close()
+    try:
+        run_chat(conn, ui.my_name, ui)
+    finally:
+        conn.close()
+
+
+def join_session(host, port, ui):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5.0)
+    try:
+        sock.connect((host, port))
+    except (OSError, socket.timeout) as e:
+        hint = " Проверьте IP, порт, что хост запущен, и настройки брандмауэра." if isinstance(e, (OSError, socket.timeout)) else ""
+        ui.log(f"Не удалось подключиться к {host}:{port} — {e}.{hint}")
+        sock.close()
+        return
+    sock.settimeout(None)
+    run_chat(sock, ui.my_name, ui)
+
+
+def interactive_menu(ui):
+    ui.my_name = ui.my_name or "Вы"
+    while True:
+        print("=" * 46)
+        print("  ЛОКАЛЬНЫЙ ЧАТ — v2")
+        print("=" * 46)
+        print("  1 — Хост:      ждать подключения")
+        print("  2 — Подключиться к хосту")
+        print("  0 — Выход")
+        mode = ask("Выберите режим [1/2/0]: ")
+        if mode is _EOF:
+            print()
+            return
+        mode = mode.lower()
+        if mode == "0":
+            print("До встречи! 👋")
+            return
+        if mode == "1":
+            port = ask_port(f"Порт [{DEFAULT_PORT}]: ", DEFAULT_PORT)
+            host_session(port, ui)
+        elif mode == "2":
+            ip = ask("IP хоста, например 192.168.1.5: ")
+            if not ip:
+                print("IP не указан.")
+                continue
+            port = ask_port(f"Порт [{DEFAULT_PORT}]: ", DEFAULT_PORT)
+            join_session(ip, port, ui)
+        else:
+            print("Введите 1, 2 или 0.")
+            continue
+        answer = ask("Снова? [Enter — да, q — нет]: ")
+        if answer is _EOF or answer.lower().startswith("q"):
+            return
+
+
+# ----------------------------------------------------------------------------
+# Точка входа
+# ----------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="LAN Chat в терминале")
+    p.add_argument("--host", action="store_true", help="запустить как хост")
+    p.add_argument("--join", metavar="IP", help="подключиться к IP хоста")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT, help="порт")
+    p.add_argument("--name", help="ваше имя в чате")
+    return p.parse_args()
+
+
+def main():
+    if IS_WINDOWS:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    args = parse_args()
+    try:
+        import getpass
+        default_name = getpass.getuser()[:30]
+    except Exception:
+        default_name = "Пользователь"
+
+    ui = UI()
+    name = args.name or ask("Ваше имя в чате: ", default_name)
+    if _is_eof(name):
+        name = default_name
+    ui.set_my_name(name or default_name)
+
+    try:
+        if args.host:
+            host_session(args.port, ui)
+        elif args.join:
+            join_session(args.join, args.port, ui)
+        else:
+            interactive_menu(ui)
+    except KeyboardInterrupt:
+        print("\nВыход.")
+
+
+if __name__ == "__main__":
+    main()
